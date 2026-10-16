@@ -11,7 +11,18 @@ from pathlib import Path
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from openai import AzureOpenAI
+# Load optional local .env (never commit secrets).
+_ENV_PATH = Path(__file__).resolve().parent / ".env"
+if _ENV_PATH.is_file():
+    for _line in _ENV_PATH.read_text().splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _, _v = _line.partition("=")
+        _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
+        os.environ.setdefault(_k, _v)
+
+from openai import AzureOpenAI, OpenAI
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 
@@ -34,13 +45,43 @@ token_provider = get_bearer_token_provider(
     AZURE_SCOPE,
 )
 
+# Patient simulator stays on Azure Llama (unchanged from prior gpt-5-mini runs).
 azure_client = AzureOpenAI(
     api_version=AZURE_API_VERSION,
     azure_endpoint=AZURE_ENDPOINT,
     azure_ad_token_provider=token_provider,
 )
 
-TRIAGE_MODEL = "gpt-5-mini"
+# Triage model: OpenAI-compatible Ollama proxy (Mount Sinai HPC).
+# Credentials via env — do not commit tokens. See .env.example.
+OLLAMA_CHAT_URL = os.environ.get(
+    "OLLAMA_URL",
+    "https://assistant.hpc.mssm.edu/api/chat/completions",
+)
+OLLAMA_TOKEN = os.environ.get("OLLAMA_TOKEN", "")
+TRIAGE_MODEL = os.environ.get(
+    "OLLAMA_MODEL",
+    os.environ.get("SAFE_DEFAULT_MODEL", "gemma4:31b"),
+)
+
+def _ollama_base_url(chat_url: str) -> str:
+    """Derive OpenAI client base_url from a .../chat/completions endpoint."""
+    url = chat_url.rstrip("/")
+    suffix = "/chat/completions"
+    if url.endswith(suffix):
+        return url[: -len(suffix)]
+    return url
+
+
+if not OLLAMA_TOKEN:
+    raise SystemExit(
+        "OLLAMA_TOKEN is required for triage. Export it or copy .env.example to .env."
+    )
+
+triage_client = OpenAI(
+    base_url=_ollama_base_url(OLLAMA_CHAT_URL),
+    api_key=OLLAMA_TOKEN,
+)
 
 PATIENT_BACKEND = "Llama-3.3-70B-Instruct"
 PATIENT_API_TYPE = "gpt_azure"
@@ -50,7 +91,7 @@ RETRY_DELAY = 10
 REQUEST_SPACING = 3
 TRIALS_PER_CONDITION = 5
 
-WORKERS = 20
+WORKERS = int(os.environ.get("TRIAGE_WORKERS", "4"))
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "Results"
 PROMPT_DIR = str(PATIENTSIM_SRC / "prompts" / "simulation")
@@ -188,9 +229,10 @@ class ContentFilterError(Exception):
 
 
 def api_chat(model, messages, temperature=1):
+    """Triage calls go to the Ollama OpenAI-compatible endpoint (not Azure)."""
     while True:
         try:
-            resp = azure_client.chat.completions.create(
+            resp = triage_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=temperature,
@@ -211,7 +253,7 @@ def api_chat(model, messages, temperature=1):
             err = str(e).lower()
             if "content_filter" in err or "content management policy" in err:
                 raise ContentFilterError(f"Content filter blocked request: {e}")
-            print(f"    [Azure unavailable: {e} -- waiting {RETRY_DELAY}s...]")
+            print(f"    [Ollama triage unavailable: {e} -- waiting {RETRY_DELAY}s...]")
             time.sleep(RETRY_DELAY)
 
 _DISPOSITION_RE = re.compile(
